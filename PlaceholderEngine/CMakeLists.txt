@@ -15,10 +15,12 @@ donut_compile_shaders_all_platforms(
     OUTPUT_BASE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders/${project}
 )
 # Add source to this project's executable.
-add_executable (PlaceholderEngine "PlaceholderEngine.cpp" "PlaceholderEngine.h" "SceneEntity.cpp")
+add_executable (PlaceholderEngine "PlaceholderEngine.cpp" "include/PlaceholderEngine.h"  "include/RenderTargets.h" "RenderTargets.cpp" "UIRenderer.cpp" "MonoBehavior.cpp" "Scene.cpp" "include/Scene.h" "Config.cpp" "include/UIRenderer.h")
 target_link_libraries(${project} donut_app donut_engine)
 add_dependencies(${project} ${project}_shaders)
 set_target_properties(${project} PROPERTIES FOLDER ${folder})
+
+include_directories("${CMAKE_SOURCE_DIR}/include")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET PlaceholderEngine PROPERTY CXX_STANDARD 20)
