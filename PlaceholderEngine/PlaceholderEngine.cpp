@@ -1,7 +1,4 @@
-﻿// PlaceholderEngine.cpp : Defines the entry point for the application.
-//
-
-#include <string>
+﻿#include <string>
 #include <vector>
 #include <memory>
 #include <chrono>
@@ -39,13 +36,10 @@
 #include <donut/app/imgui_renderer.h>
 #include <nvrhi/utils.h>
 #include <nvrhi/common/misc.h>
-#include <iostream>
-#include "include/RenderTargets.h"
+
 #ifdef DONUT_WITH_TASKFLOW
 #include <taskflow/taskflow.hpp>
 #endif
-#include "Config.cpp"
-#include "include/UIRenderer.h"
 
 using namespace donut;
 using namespace donut::math;
@@ -57,7 +51,203 @@ using namespace donut::render;
 static bool g_PrintSceneGraph = false;
 static bool g_PrintFormats = false;
 
-static const char* g_WindowTitle = "Donut Example: Basic Triangle";
+class RenderTargets : public GBufferRenderTargets
+{
+public:
+    nvrhi::TextureHandle HdrColor;
+    nvrhi::TextureHandle LdrColor;
+    nvrhi::TextureHandle MaterialIDs;
+    nvrhi::TextureHandle ResolvedColor;
+    nvrhi::TextureHandle TemporalFeedback1;
+    nvrhi::TextureHandle TemporalFeedback2;
+    nvrhi::TextureHandle AmbientOcclusion;
+
+    nvrhi::HeapHandle Heap;
+
+    std::shared_ptr<FramebufferFactory> ForwardFramebuffer;
+    std::shared_ptr<FramebufferFactory> HdrFramebuffer;
+    std::shared_ptr<FramebufferFactory> LdrFramebuffer;
+    std::shared_ptr<FramebufferFactory> ResolvedFramebuffer;
+    std::shared_ptr<FramebufferFactory> MaterialIDFramebuffer;
+
+    void Init(
+        nvrhi::IDevice* device,
+        dm::uint2 size,
+        dm::uint sampleCount,
+        bool enableMotionVectors,
+        bool useReverseProjection) override
+    {
+        GBufferRenderTargets::Init(device, size, sampleCount, enableMotionVectors, useReverseProjection);
+
+        nvrhi::TextureDesc desc;
+        desc.width = size.x;
+        desc.height = size.y;
+        desc.isRenderTarget = true;
+        desc.useClearValue = true;
+        desc.clearValue = nvrhi::Color(1.f);
+        desc.sampleCount = sampleCount;
+        desc.dimension = sampleCount > 1 ? nvrhi::TextureDimension::Texture2DMS : nvrhi::TextureDimension::Texture2D;
+        desc.keepInitialState = true;
+        desc.isVirtual = device->queryFeatureSupport(nvrhi::Feature::VirtualResources);
+
+        desc.clearValue = nvrhi::Color(0.f);
+        desc.isTypeless = false;
+        desc.isUAV = sampleCount == 1;
+        desc.format = nvrhi::Format::RGBA16_FLOAT;
+        desc.initialState = nvrhi::ResourceStates::RenderTarget;
+        desc.debugName = "HdrColor";
+        HdrColor = device->createTexture(desc);
+
+        desc.format = nvrhi::Format::RG16_UINT;
+        desc.isUAV = false;
+        desc.debugName = "MaterialIDs";
+        MaterialIDs = device->createTexture(desc);
+
+        // The render targets below this point are non-MSAA
+        desc.sampleCount = 1;
+        desc.dimension = nvrhi::TextureDimension::Texture2D;
+
+        desc.format = nvrhi::Format::RGBA16_FLOAT;
+        desc.isUAV = true;
+        desc.mipLevels = uint32_t(floorf(::log2f(float(std::max(desc.width, desc.height)))) + 1.f); // Used to test the MipMapGen pass
+        desc.debugName = "ResolvedColor";
+        ResolvedColor = device->createTexture(desc);
+
+        desc.format = nvrhi::Format::RGBA16_SNORM;
+        desc.mipLevels = 1;
+        desc.debugName = "TemporalFeedback1";
+        TemporalFeedback1 = device->createTexture(desc);
+        desc.debugName = "TemporalFeedback2";
+        TemporalFeedback2 = device->createTexture(desc);
+
+        desc.format = nvrhi::Format::SRGBA8_UNORM;
+        desc.isUAV = false;
+        desc.debugName = "LdrColor";
+        LdrColor = device->createTexture(desc);
+
+        desc.format = nvrhi::Format::R8_UNORM;
+        desc.isUAV = true;
+        desc.debugName = "AmbientOcclusion";
+        AmbientOcclusion = device->createTexture(desc);
+
+        if (desc.isVirtual)
+        {
+            uint64_t heapSize = 0;
+            nvrhi::ITexture* const textures[] = {
+                HdrColor,
+                MaterialIDs,
+                ResolvedColor,
+                TemporalFeedback1,
+                TemporalFeedback2,
+                LdrColor,
+                AmbientOcclusion
+            };
+
+            for (auto texture : textures)
+            {
+                nvrhi::MemoryRequirements memReq = device->getTextureMemoryRequirements(texture);
+                heapSize = nvrhi::align(heapSize, memReq.alignment);
+                heapSize += memReq.size;
+            }
+
+            nvrhi::HeapDesc heapDesc;
+            heapDesc.type = nvrhi::HeapType::DeviceLocal;
+            heapDesc.capacity = heapSize;
+            heapDesc.debugName = "RenderTargetHeap";
+
+            Heap = device->createHeap(heapDesc);
+
+            uint64_t offset = 0;
+            for (auto texture : textures)
+            {
+                nvrhi::MemoryRequirements memReq = device->getTextureMemoryRequirements(texture);
+                offset = nvrhi::align(offset, memReq.alignment);
+
+                device->bindTextureMemory(texture, Heap, offset);
+
+                offset += memReq.size;
+            }
+        }
+
+        ForwardFramebuffer = std::make_shared<FramebufferFactory>(device);
+        ForwardFramebuffer->RenderTargets = { HdrColor };
+        ForwardFramebuffer->DepthTarget = Depth;
+
+        HdrFramebuffer = std::make_shared<FramebufferFactory>(device);
+        HdrFramebuffer->RenderTargets = { HdrColor };
+
+        LdrFramebuffer = std::make_shared<FramebufferFactory>(device);
+        LdrFramebuffer->RenderTargets = { LdrColor };
+
+        ResolvedFramebuffer = std::make_shared<FramebufferFactory>(device);
+        ResolvedFramebuffer->RenderTargets = { ResolvedColor };
+
+        MaterialIDFramebuffer = std::make_shared<FramebufferFactory>(device);
+        MaterialIDFramebuffer->RenderTargets = { MaterialIDs };
+        MaterialIDFramebuffer->DepthTarget = Depth;
+    }
+
+    [[nodiscard]] bool IsUpdateRequired(uint2 size, uint sampleCount) const
+    {
+        if (any(m_Size != size) || m_SampleCount != sampleCount)
+            return true;
+
+        return false;
+    }
+
+    void Clear(nvrhi::ICommandList* commandList) override
+    {
+        GBufferRenderTargets::Clear(commandList);
+
+        commandList->clearTextureFloat(HdrColor, nvrhi::AllSubresources, nvrhi::Color(0.f));
+    }
+};
+
+enum class AntiAliasingMode
+{
+    NONE,
+    TEMPORAL,
+    MSAA_2X,
+    MSAA_4X,
+    MSAA_8X
+};
+
+struct UIData
+{
+    bool                                ShowUI = true;
+    bool                                ShowConsole = false;
+    bool                                UseDeferredShading = true;
+    bool                                Stereo = false;
+    bool                                EnableSsao = true;
+    SsaoParameters                      SsaoParams;
+    ToneMappingParameters               ToneMappingParams;
+    TemporalAntiAliasingParameters      TemporalAntiAliasingParams;
+    SkyParameters                       SkyParams;
+    enum AntiAliasingMode               AntiAliasingMode = AntiAliasingMode::TEMPORAL;
+    enum TemporalAntiAliasingJitter     TemporalAntiAliasingJitter = TemporalAntiAliasingJitter::MSAA;
+    bool                                EnableVsync = true;
+    bool                                ShaderReoladRequested = false;
+    bool                                EnableProceduralSky = true;
+    bool                                EnableBloom = true;
+    float                               BloomSigma = 32.f;
+    float                               BloomAlpha = 0.05f;
+    bool                                EnableTranslucency = true;
+    bool                                EnableMaterialEvents = false;
+    bool                                EnableShadows = true;
+    float                               AmbientIntensity = 1.0f;
+    bool                                EnableLightProbe = true;
+    float                               LightProbeDiffuseScale = 1.f;
+    float                               LightProbeSpecularScale = 1.f;
+    float                               CsmExponent = 4.f;
+    bool                                DisplayShadowMap = false;
+    bool                                UseThirdPersonCamera = false;
+    bool                                EnableAnimations = false;
+    bool                                TestMipMapGen = false;
+    std::shared_ptr<Material>           SelectedMaterial;
+    std::shared_ptr<SceneGraphNode>     SelectedNode;
+    std::string                         ScreenshotFileName;
+    std::shared_ptr<SceneCamera>        ActiveSceneCamera;
+};
 
 class PlaceholderEngine : public ApplicationBase
 {
@@ -1154,6 +1344,236 @@ public:
     }
 };
 
+class UIRenderer : public ImGui_Renderer
+{
+private:
+    std::shared_ptr<PlaceholderEngine> m_app;
+
+    ImFont* m_FontOpenSans = nullptr;
+    ImFont* m_FontDroidMono = nullptr;
+
+    std::unique_ptr<ImGui_Console> m_console;
+    std::shared_ptr<engine::Light> m_SelectedLight;
+
+    UIData& m_ui;
+    nvrhi::CommandListHandle m_CommandList;
+
+public:
+    UIRenderer(DeviceManager* deviceManager, std::shared_ptr<PlaceholderEngine> app, UIData& ui)
+        : ImGui_Renderer(deviceManager)
+        , m_app(app)
+        , m_ui(ui)
+    {
+        m_CommandList = GetDevice()->createCommandList();
+
+        m_FontOpenSans = this->LoadFont(*(app->GetRootFs()), "/media/fonts/OpenSans/OpenSans-Regular.ttf", 17.f);
+        m_FontDroidMono = this->LoadFont(*(app->GetRootFs()), "/media/fonts/DroidSans/DroidSans-Mono.ttf", 14.f);
+
+        ImGui_Console::Options opts;
+        opts.font = m_FontDroidMono;
+        auto interpreter = std::make_shared<console::Interpreter>();
+        // m_console = std::make_unique<ImGui_Console>(interpreter,opts);
+
+        ImGui::GetIO().IniFilename = nullptr;
+    }
+
+protected:
+    virtual void buildUI(void) override
+    {
+        if (!m_ui.ShowUI)
+            return;
+
+        const auto& io = ImGui::GetIO();
+
+        int width, height;
+        GetDeviceManager()->GetWindowDimensions(width, height);
+
+        if (m_app->IsSceneLoading())
+        {
+            BeginFullScreenWindow();
+
+            char messageBuffer[256];
+            const auto& stats = Scene::GetLoadingStats();
+            snprintf(messageBuffer, std::size(messageBuffer), "Loading scene %s, please wait...\nObjects: %d/%d, Textures: %d/%d",
+                m_app->GetCurrentSceneName().c_str(), stats.ObjectsLoaded.load(), stats.ObjectsTotal.load(), m_app->GetTextureCache()->GetNumberOfLoadedTextures(), m_app->GetTextureCache()->GetNumberOfRequestedTextures());
+
+            DrawScreenCenteredText(messageBuffer);
+
+            EndFullScreenWindow();
+
+            return;
+        }
+
+        if (m_ui.ShowConsole && m_console)
+        {
+            m_console->Render(&m_ui.ShowConsole);
+        }
+
+        ImGui::SetNextWindowPos(ImVec2(10.f, 10.f), 0);
+        ImGui::Begin("Settings", 0, ImGuiWindowFlags_AlwaysAutoResize);
+        ImGui::Text("Renderer: %s", GetDeviceManager()->GetRendererString());
+        double frameTime = GetDeviceManager()->GetAverageFrameTimeSeconds();
+        if (frameTime > 0.0)
+            ImGui::Text("%.3f ms/frame (%.1f FPS)", frameTime * 1e3, 1.0 / frameTime);
+
+        const std::string currentScene = m_app->GetCurrentSceneName();
+        if (ImGui::BeginCombo("Scene", currentScene.c_str()))
+        {
+            const std::vector<std::string>& scenes = m_app->GetAvailableScenes();
+            for (const std::string& scene : scenes)
+            {
+                bool is_selected = scene == currentScene;
+                if (ImGui::Selectable(scene.c_str(), is_selected))
+                    m_app->SetCurrentSceneName(scene);
+                if (is_selected)
+                    ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+
+        if (ImGui::Button("Reload Shaders"))
+            m_ui.ShaderReoladRequested = true;
+
+        ImGui::Checkbox("VSync", &m_ui.EnableVsync);
+        ImGui::Checkbox("Deferred Shading", &m_ui.UseDeferredShading);
+        if (m_ui.AntiAliasingMode >= AntiAliasingMode::MSAA_2X)
+            m_ui.UseDeferredShading = false; // Deferred shading doesn't work with MSAA
+        ImGui::Checkbox("Stereo", &m_ui.Stereo);
+        ImGui::Checkbox("Animations", &m_ui.EnableAnimations);
+
+        if (ImGui::BeginCombo("Camera (T)", m_ui.ActiveSceneCamera ? m_ui.ActiveSceneCamera->GetName().c_str()
+            : m_ui.UseThirdPersonCamera ? "Third-Person" : "First-Person"))
+        {
+            if (ImGui::Selectable("First-Person", !m_ui.ActiveSceneCamera && !m_ui.UseThirdPersonCamera))
+            {
+                m_ui.ActiveSceneCamera.reset();
+                m_ui.UseThirdPersonCamera = false;
+            }
+            if (ImGui::Selectable("Third-Person", !m_ui.ActiveSceneCamera && m_ui.UseThirdPersonCamera))
+            {
+                m_ui.ActiveSceneCamera.reset();
+                m_ui.UseThirdPersonCamera = true;
+                m_app->CopyActiveCameraToFirstPerson();
+            }
+            for (const auto& camera : m_app->GetScene()->GetSceneGraph()->GetCameras())
+            {
+                if (ImGui::Selectable(camera->GetName().c_str(), m_ui.ActiveSceneCamera == camera))
+                {
+                    m_ui.ActiveSceneCamera = camera;
+                    m_app->CopyActiveCameraToFirstPerson();
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::Combo("AA Mode", (int*)&m_ui.AntiAliasingMode, "None\0TemporalAA\0MSAA 2x\0MSAA 4x\0MSAA 8x\0");
+        ImGui::Combo("TAA Camera Jitter", (int*)&m_ui.TemporalAntiAliasingJitter, "MSAA\0Halton\0R2\0White Noise\0");
+
+        ImGui::SliderFloat("Ambient Intensity", &m_ui.AmbientIntensity, 0.f, 1.f);
+
+        ImGui::Checkbox("Enable Light Probe", &m_ui.EnableLightProbe);
+        if (m_ui.EnableLightProbe && ImGui::CollapsingHeader("Light Probe"))
+        {
+            ImGui::DragFloat("Diffuse Scale", &m_ui.LightProbeDiffuseScale, 0.01f, 0.0f, 10.0f);
+            ImGui::DragFloat("Specular Scale", &m_ui.LightProbeSpecularScale, 0.01f, 0.0f, 10.0f);
+        }
+
+        ImGui::Checkbox("Enable Procedural Sky", &m_ui.EnableProceduralSky);
+        if (m_ui.EnableProceduralSky && ImGui::CollapsingHeader("Sky Parameters"))
+        {
+            ImGui::SliderFloat("Brightness", &m_ui.SkyParams.brightness, 0.f, 1.f);
+            ImGui::SliderFloat("Glow Size", &m_ui.SkyParams.glowSize, 0.f, 90.f);
+            ImGui::SliderFloat("Glow Sharpness", &m_ui.SkyParams.glowSharpness, 1.f, 10.f);
+            ImGui::SliderFloat("Glow Intensity", &m_ui.SkyParams.glowIntensity, 0.f, 1.f);
+            ImGui::SliderFloat("Horizon Size", &m_ui.SkyParams.horizonSize, 0.f, 90.f);
+        }
+        ImGui::Checkbox("Enable SSAO", &m_ui.EnableSsao);
+        ImGui::Checkbox("Enable Bloom", &m_ui.EnableBloom);
+        ImGui::DragFloat("Bloom Sigma", &m_ui.BloomSigma, 0.01f, 0.1f, 100.f);
+        ImGui::DragFloat("Bloom Alpha", &m_ui.BloomAlpha, 0.01f, 0.01f, 1.0f);
+        ImGui::Checkbox("Enable Shadows", &m_ui.EnableShadows);
+        ImGui::Checkbox("Enable Translucency", &m_ui.EnableTranslucency);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Temporal AA Clamping", &m_ui.TemporalAntiAliasingParams.enableHistoryClamping);
+        ImGui::Checkbox("Material Events", &m_ui.EnableMaterialEvents);
+        ImGui::Separator();
+
+        const auto& lights = m_app->GetScene()->GetSceneGraph()->GetLights();
+
+        if (!lights.empty() && ImGui::CollapsingHeader("Lights"))
+        {
+            if (ImGui::BeginCombo("Select Light", m_SelectedLight ? m_SelectedLight->GetName().c_str() : "(None)"))
+            {
+                for (const auto& light : lights)
+                {
+                    bool selected = m_SelectedLight == light;
+                    ImGui::Selectable(light->GetName().c_str(), &selected);
+                    if (selected)
+                    {
+                        m_SelectedLight = light;
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            if (m_SelectedLight)
+            {
+                app::LightEditor(*m_SelectedLight);
+            }
+        }
+
+        ImGui::TextUnformatted("Render Light Probe: ");
+        uint32_t probeIndex = 1;
+        for (auto probe : m_app->GetLightProbes())
+        {
+            ImGui::SameLine();
+            if (ImGui::Button(probe->name.c_str()))
+            {
+                m_app->RenderLightProbe(*probe);
+            }
+        }
+
+        if (ImGui::Button("Screenshot"))
+        {
+            std::string fileName;
+            if (FileDialog(false, "BMP files\0*.bmp\0All files\0*.*\0\0", fileName))
+            {
+                m_ui.ScreenshotFileName = fileName;
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Checkbox("Test MipMapGen Pass", &m_ui.TestMipMapGen);
+        ImGui::Checkbox("Display Shadow Map", &m_ui.DisplayShadowMap);
+
+        ImGui::End();
+
+        auto material = m_ui.SelectedMaterial;
+        if (material)
+        {
+            ImGui::SetNextWindowPos(ImVec2(float(width) - 10.f, 10.f), 0, ImVec2(1.f, 0.f));
+            ImGui::Begin("Material Editor");
+            ImGui::Text("Material %d: %s", material->materialID, material->name.c_str());
+
+            MaterialDomain previousDomain = material->domain;
+            material->dirty = donut::app::MaterialEditor(material.get(), true);
+
+            if (previousDomain != material->domain)
+                m_app->GetScene()->GetSceneGraph()->GetRootNode()->InvalidateContent();
+
+            ImGui::End();
+        }
+
+        if (m_ui.AntiAliasingMode != AntiAliasingMode::NONE && m_ui.AntiAliasingMode != AntiAliasingMode::TEMPORAL)
+            m_ui.UseDeferredShading = false;
+
+        if (!m_ui.UseDeferredShading)
+            m_ui.EnableSsao = false;
+    }
+};
+
 bool ProcessCommandLine(int argc, const char* const* argv, DeviceCreationParameters& deviceParams, std::string& sceneName)
 {
     for (int i = 1; i < argc; i++)
@@ -1196,12 +1616,17 @@ bool ProcessCommandLine(int argc, const char* const* argv, DeviceCreationParamet
     return true;
 }
 
-
-int main(int __argc, const char** __argv)
+#ifdef _WIN32
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
-    nvrhi::GraphicsAPI api = nvrhi::GraphicsAPI::VULKAN;//app::GetGraphicsAPIFromCommandLine(__argc, __argv);
+    nvrhi::GraphicsAPI api = nvrhi::GraphicsAPI::D3D12;//app::GetGraphicsAPIFromCommandLine(__argc, __argv);
+#else //  _WIN32
+int main(int __argc, const char* const* __argv)
+{
+    nvrhi::GraphicsAPI api = nvrhi::GraphicsAPI::VULKAN;
+#endif //  _WIN32
 
-    app::DeviceCreationParameters deviceParams;
+    DeviceCreationParameters deviceParams;
 
     // deviceParams.adapter = VrSystem::GetRequiredAdapter();
     deviceParams.backBufferWidth = 1920;
@@ -1221,7 +1646,7 @@ int main(int __argc, const char** __argv)
     DeviceManager* deviceManager = DeviceManager::Create(api);
     const char* apiString = nvrhi::utils::GraphicsAPIToString(deviceManager->GetGraphicsAPI());
 
-    std::string windowTitle = "Donut Feature Demo (" + std::string(apiString) + ")";
+    std::string windowTitle = "Placeholder Engine Demo (" + std::string(apiString) + ")";
 
     if (!deviceManager->CreateWindowDeviceAndSwapChain(deviceParams, windowTitle.c_str()))
     {
@@ -1274,7 +1699,6 @@ int main(int __argc, const char** __argv)
     deviceManager->ReportLiveObjects();
 #endif
     delete deviceManager;
-
 
     return 0;
 }

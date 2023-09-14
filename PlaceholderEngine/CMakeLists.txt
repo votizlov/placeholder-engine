@@ -15,8 +15,8 @@ donut_compile_shaders_all_platforms(
     OUTPUT_BASE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders/${project}
 )
 # Add source to this project's executable.
-add_executable (PlaceholderEngine "PlaceholderEngine.cpp" "include/PlaceholderEngine.h"  "include/RenderTargets.h" "RenderTargets.cpp" "UIRenderer.cpp" "MonoBehavior.cpp" "Scene.cpp" "include/Scene.h" "Config.cpp" "include/UIRenderer.h")
-target_link_libraries(${project} donut_app donut_engine)
+add_executable (PlaceholderEngine WIN32 "PlaceholderEngine.cpp" )#  "MonoBehavior.cpp" "Scene.cpp" "include/Scene.h" "Config.cpp")
+target_link_libraries(${project} donut_render donut_app donut_engine)
 add_dependencies(${project} ${project}_shaders)
 set_target_properties(${project} PROPERTIES FOLDER ${folder})
 
